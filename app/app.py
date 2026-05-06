@@ -13,7 +13,7 @@ from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
 
 device = torch.device("cpu")
 
@@ -89,6 +89,7 @@ def predict_fundus_gate(img):
 
     return fundus_prob, decision
 
+
 # =========================
 # PREPROCESS (SAFE)
 # =========================
@@ -101,11 +102,12 @@ def preprocess_retina(img):
     start_x = w // 2 - min_dim // 2
     start_y = h // 2 - min_dim // 2
 
-    img = img[start_y:start_y+min_dim, start_x:start_x+min_dim]
+    img = img[start_y:start_y + min_dim, start_x:start_x + min_dim]
     img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
 
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     return img
+
 
 # =========================
 # ANALYZE ROUTE
@@ -118,12 +120,12 @@ def analyze():
         return jsonify({"error": "No image uploaded"}), 400
 
     file = request.files["image"]
-    
+
     # 🔥 FILE SIZE CHECK (5MB limit)
     file.seek(0, os.SEEK_END)
     file_length = file.tell()
     file.seek(0)
-    
+
     if file_length > 5 * 1024 * 1024:
         return jsonify({"error": "File too large (max 5MB)"}), 400
 
@@ -143,20 +145,32 @@ def analyze():
 
     if decision == "reject_non_fundus":
         return jsonify({
+            "success": True,
+            "fundus_status": "rejected",
             "prediction": "Invalid image",
+            "referable": None,
             "message": "Please upload a retinal fundus image",
             "confidence": fundus_prob,
+            "severity": None,
+            "severity_label": None,
             "heatmap_url": None,
-            "processed_image_url": None
+            "processed_image_url": None,
+            "disclaimer": None
         })
 
     if decision == "uncertain":
         return jsonify({
+            "success": True,
+            "fundus_status": "uncertain",
             "prediction": "Uncertain image",
+            "referable": None,
             "message": "Image unclear, please re-upload",
             "confidence": fundus_prob,
+            "severity": None,
+            "severity_label": None,
             "heatmap_url": None,
-            "processed_image_url": None
+            "processed_image_url": None,
+            "disclaimer": None
         })
 
     # =========================
@@ -183,17 +197,32 @@ def analyze():
     severity = int(np.argmax(probs))
 
     # =========================
-    # 🔥 REFERABLE LOGIC (FIXED)
+    # REFERABLE + BORDERLINE LOGIC
     # =========================
     referable_score = probs[2] + probs[3] + probs[4]
+    borderline_score = probs[1] + probs[2] + probs[3] + probs[4]
 
     print("PROBS:", probs)
     print("REFERABLE SCORE:", referable_score)
+    print("BORDERLINE SCORE:", borderline_score)
 
-    if referable_score > 0.35:
+    if referable_score >= 0.30:
         prediction = "Referable DR"
+        referable = True
+        review_priority = "priority"
+        risk_flag = "review_needed"
+
+    elif borderline_score >= 0.45:
+        prediction = "Clinician Review Recommended"
+        referable = None
+        review_priority = "priority"
+        risk_flag = "borderline_review"
+
     else:
         prediction = "No Referable DR"
+        referable = False
+        review_priority = "routine"
+        risk_flag = "low"
 
     # =========================
     # GRAD-CAM
@@ -221,23 +250,72 @@ def analyze():
     ]
 
     response = {
+        "success": True,
+        "fundus_status": "accepted",
         "prediction": prediction,
+        "referable": referable,
         "confidence": confidence,
         "severity": severity,
         "severity_label": severity_labels[severity],
+
+        # NEW SAFETY / REVIEW FIELDS
+        "risk_flag": risk_flag,
+        "suggested_review_priority": review_priority,
+
+        "referable_score": float(referable_score),
+        "borderline_score": float(borderline_score),
+
+        "class_probabilities": {
+            "no_dr": float(probs[0]),
+            "mild": float(probs[1]),
+            "moderate": float(probs[2]),
+            "severe": float(probs[3]),
+            "proliferative": float(probs[4]),
+        },
+
+        "maculopathy_status": "not_assessed_by_sentinel_model",
+
+        "observations": [
+            f"Highest model class: {severity_labels[severity]}",
+            f"Referable score: {float(referable_score):.2f}",
+            f"Borderline review score: {float(borderline_score):.2f}",
+            "Maculopathy is not separately assessed by the current Sentinel model.",
+        ],
+        "draft_note": (
+            f"Sentinel AI assessment suggests {prediction.lower()} "
+            f"with confidence {confidence:.2f}. "
+            f"Model severity classification: {severity_labels[severity]}. "
+            f"Referable score: {float(referable_score):.2f}. "
+            f"Borderline review score: {float(borderline_score):.2f}. "
+            f"Maculopathy is not separately assessed by the current Sentinel model. "
+            f"Clinical review is advised before any clinical decision is made."
+        ),
+        # EXISTING FIELDS
         "heatmap_url": f"/static/{heatmap_filename}",
         "processed_image_url": f"/static/{processed_filename}",
-        "disclaimer": "This tool provides AI-assisted screening for diabetic retinopathy only and does not replace professional clinical diagnosis. The model is not trained to detect other retinal or ocular conditions (e.g. retinal detachment, glaucoma, macular degeneration). All images should be reviewed by a qualified eye care professional before clinical decisions are made."
+        "message": None,
+        "model_version": "sentinel-ai-v1",
+
+        "disclaimer": (
+            "This tool provides AI-assisted screening for diabetic retinopathy only "
+            "and does not replace professional clinical diagnosis. "
+            "The model is not trained to detect other retinal or ocular conditions "
+            "(e.g. retinal detachment, glaucoma, macular degeneration). "
+            "All images should be reviewed by a qualified eye care professional "
+            "before clinical decisions are made."
+        ),
     }
 
     print("🔥 RESPONSE:", response)
 
     return jsonify(response)
 
+
 # =========================
 @app.route("/")
 def index():
     return "Backend running..."
+
 
 # =========================
 if __name__ == "__main__":
